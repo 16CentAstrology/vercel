@@ -1,33 +1,84 @@
-import chalk from 'chalk';
+import chalk, { type Chalk } from 'chalk';
+import * as ansiEscapes from 'ansi-escapes';
+import { supportsHyperlink as detectSupportsHyperlink } from 'supports-hyperlinks';
 import renderLink from './link';
-import wait, { StopSpinner } from './wait';
-import type { WritableTTY } from '../../types';
+import wait, { type StopSpinner } from './wait';
 import { errorToString } from '@vercel/error-utils';
+import { removeEmoji } from '../emoji';
+import type * as tty from 'tty';
+import { inspect } from 'util';
 
 const IS_TEST = process.env.NODE_ENV === 'test';
 
 export interface OutputOptions {
+  stream?: tty.WriteStream;
   debug?: boolean;
+  supportsHyperlink?: boolean;
+  noColor?: boolean;
 }
 
 export interface LogOptions {
-  color?: typeof chalk;
+  color?: Chalk;
 }
 
+export interface LinkOptions {
+  color?: false | ((text: string) => string);
+  fallback?: false | (() => string);
+}
+
+let defaultChalkColorLevel: chalk.Level = 0;
+
 export class Output {
-  stream: WritableTTY;
-  debugEnabled: boolean;
+  stream!: tty.WriteStream;
+  debugEnabled!: boolean;
+  supportsHyperlink!: boolean;
+  colorDisabled!: boolean;
   private spinnerMessage: string;
   private _spinner: StopSpinner | null;
 
-  constructor(
-    stream: WritableTTY,
-    { debug: debugEnabled = false }: OutputOptions = {}
-  ) {
-    this.stream = stream;
-    this.debugEnabled = debugEnabled;
+  constructor(stream: tty.WriteStream, options: OutputOptions = {}) {
     this.spinnerMessage = '';
     this._spinner = null;
+
+    this.initialize({
+      ...options,
+      stream,
+    });
+  }
+
+  /**
+   * Parts of the constructor logic that can be called again after construction
+   * to change some values.
+   */
+  initialize({
+    stream,
+    debug: debugEnabled,
+    supportsHyperlink,
+    noColor,
+  }: OutputOptions = {}) {
+    if (stream !== undefined) {
+      this.stream = stream;
+    }
+
+    if (debugEnabled !== undefined) {
+      this.debugEnabled = debugEnabled;
+    }
+
+    if (supportsHyperlink === undefined) {
+      this.supportsHyperlink = detectSupportsHyperlink(this.stream);
+    } else {
+      this.supportsHyperlink = supportsHyperlink;
+    }
+
+    if (noColor !== undefined) {
+      this.colorDisabled = getNoColor(noColor);
+      if (this.colorDisabled) {
+        defaultChalkColorLevel = chalk.level;
+        chalk.level = 0;
+      } else {
+        chalk.level = defaultChalkColorLevel;
+      }
+    }
   }
 
   isDebugEnabled = () => {
@@ -35,6 +86,9 @@ export class Output {
   };
 
   print = (str: string) => {
+    if (this.colorDisabled) {
+      str = removeEmoji(str);
+    }
     this.stopSpinner();
     this.stream.write(str);
   };
@@ -99,12 +153,12 @@ export class Output {
     this.print(`${chalk.cyan('> Success!')} ${str}\n`);
   };
 
-  debug = (str: string) => {
+  debug = (debug: unknown) => {
     if (this.debugEnabled) {
       this.log(
         `${chalk.bold('[debug]')} ${chalk.gray(
           `[${new Date().toISOString()}]`
-        )} ${str}`
+        )} ${debugToString(debug)}`
       );
     }
   };
@@ -167,4 +221,45 @@ export class Output {
 
     return promise;
   };
+
+  /**
+   * Returns an ANSI formatted hyperlink when support has been enabled.
+   */
+  link = (
+    text: string,
+    url: string,
+    { fallback, color = chalk.cyan }: LinkOptions = {}
+  ): string => {
+    // Based on https://github.com/sindresorhus/terminal-link (MIT license)
+    if (!this.supportsHyperlink) {
+      // If the fallback has been explicitly disabled, don't modify the text itself
+      if (fallback === false) {
+        return renderLink(text);
+      }
+
+      return typeof fallback === 'function'
+        ? fallback()
+        : `${text} (${renderLink(url)})`;
+    }
+
+    return ansiEscapes.link(color ? color(text) : text, url);
+  };
+}
+
+function getNoColor(noColorArg: boolean | undefined): boolean {
+  // FORCE_COLOR: the standard supported by chalk https://github.com/chalk/chalk#supportscolor
+  // NO_COLOR: the standard we want to support https://no-color.org/
+  // noColorArg: the `--no-color` arg passed to the CLI command
+  const noColor =
+    process.env.FORCE_COLOR === '0' ||
+    process.env.NO_COLOR === '1' ||
+    noColorArg;
+  return !!noColor;
+}
+
+function debugToString(debug: unknown): string {
+  if (typeof debug === 'string') {
+    return debug;
+  }
+  return inspect(debug);
 }
